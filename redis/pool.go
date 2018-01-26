@@ -16,7 +16,6 @@ package redis
 
 import (
 	"bytes"
-	"container/list"
 	"crypto/rand"
 	"crypto/sha1"
 	"errors"
@@ -156,13 +155,55 @@ type Pool struct {
 	closed bool
 	active int
 
-	// Stack of idleConn with most recently used at the front.
-	idle list.List
+	idle idleList
+}
+
+type idleList struct {
+	count       int
+	front, back *idleConn
 }
 
 type idleConn struct {
-	c Conn
-	t time.Time
+	c          Conn
+	t          time.Time
+	next, prev *idleConn
+}
+
+func (l *idleList) pushFront(ic *idleConn) {
+	ic.next = l.front
+	ic.prev = nil
+	if l.count == 0 {
+		l.back = ic
+	} else {
+		l.front.prev = ic
+	}
+	l.front = ic
+	l.count++
+	return
+}
+
+func (l *idleList) popFront() {
+	ic := l.front
+	l.count--
+	if l.count == 0 {
+		l.front, l.back = nil, nil
+	} else {
+		ic.next.prev = nil
+		l.front = ic.next
+	}
+	ic.next, ic.prev = nil, nil
+}
+
+func (l *idleList) popBack() {
+	ic := l.back
+	l.count--
+	if l.count == 0 {
+		l.front, l.back = nil, nil
+	} else {
+		ic.prev.next = nil
+		l.back = ic.prev
+	}
+	ic.next, ic.prev = nil, nil
 }
 
 // NewPool creates a new pool.
@@ -198,7 +239,7 @@ func (p *Pool) Stats() PoolStats {
 	p.mu.Lock()
 	stats := PoolStats{
 		ActiveCount: p.active,
-		IdleCount:   p.idle.Len(),
+		IdleCount:   p.idle.count,
 	}
 	p.mu.Unlock()
 
@@ -216,7 +257,7 @@ func (p *Pool) ActiveCount() int {
 // IdleCount returns the number of idle connections in the pool.
 func (p *Pool) IdleCount() int {
 	p.mu.Lock()
-	idle := p.idle.Len()
+	idle := p.idle.count
 	p.mu.Unlock()
 	return idle
 }
@@ -224,16 +265,17 @@ func (p *Pool) IdleCount() int {
 // Close releases the resources used by the pool.
 func (p *Pool) Close() error {
 	p.mu.Lock()
-	idle := p.idle
-	p.idle.Init()
 	p.closed = true
-	p.active -= idle.Len()
+	p.active -= p.idle.count
+	ic := p.idle.front
+	p.idle.front, p.idle.back = nil, nil
+	p.idle.count = 0
 	if p.cond != nil {
 		p.cond.Broadcast()
 	}
 	p.mu.Unlock()
-	for e := idle.Front(); e != nil; e = e.Next() {
-		e.Value.(idleConn).c.Close()
+	for ; ic != nil; ic = ic.next {
+		ic.c.Close()
 	}
 	return nil
 }
@@ -255,16 +297,15 @@ func (p *Pool) get() (Conn, error) {
 	// Prune stale connections.
 
 	if timeout := p.IdleTimeout; timeout > 0 {
-		for i, n := 0, p.idle.Len(); i < n; i++ {
-			e := p.idle.Back()
-			if e == nil {
+		for i, n := 0, p.idle.count; i < n; i++ {
+			ic := p.idle.back
+			if ic == nil {
 				break
 			}
-			ic := e.Value.(idleConn)
 			if ic.t.Add(timeout).After(nowFunc()) {
 				break
 			}
-			p.idle.Remove(e)
+			p.idle.popBack()
 			p.release()
 			p.mu.Unlock()
 			ic.c.Close()
@@ -275,13 +316,12 @@ func (p *Pool) get() (Conn, error) {
 	for {
 		// Get idle connection.
 
-		for i, n := 0, p.idle.Len(); i < n; i++ {
-			e := p.idle.Front()
-			if e == nil {
+		for i, n := 0, p.idle.count; i < n; i++ {
+			ic := p.idle.front
+			if ic == nil {
 				break
 			}
-			ic := e.Value.(idleConn)
-			p.idle.Remove(e)
+			p.idle.popFront()
 			test := p.TestOnBorrow
 			p.mu.Unlock()
 			if test == nil || test(ic.c, ic.t) == nil {
@@ -331,9 +371,10 @@ func (p *Pool) put(c Conn, forceClose bool) error {
 	err := c.Err()
 	p.mu.Lock()
 	if !p.closed && err == nil && !forceClose {
-		p.idle.PushFront(idleConn{t: nowFunc(), c: c})
-		if p.idle.Len() > p.MaxIdle {
-			c = p.idle.Remove(p.idle.Back()).(idleConn).c
+		p.idle.pushFront(&idleConn{t: nowFunc(), c: c})
+		if p.idle.count > p.MaxIdle {
+			c = p.idle.back.c
+			p.idle.popBack()
 		} else {
 			c = nil
 		}
